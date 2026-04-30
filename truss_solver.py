@@ -1,0 +1,485 @@
+"""
+2D Truss Solver — Matrix Structural Analysis (Direct Stiffness Method)
+
+WHAT THIS SCRIPT NEEDS FROM YOU
+===============================
+
+(1) NODE-ELEMENT CONNECTIVITY CHART  (CSV or interactive)
+    For every element, supply ONE row:
+
+        element , node1 , node2 , theta_deg , E_GPa , A_mm2 , L_m
+
+    where theta_deg is measured from the +x axis to the vector
+    going FROM node1 TO node2 (counter-clockwise positive).
+
+    Notes:
+      * Node names are arbitrary strings (A, B, C, 1, 2, ...).
+        Each node automatically gets two DOFs: dX and dY.
+      * Direction cosines are derived as l = cos(theta), m = sin(theta).
+      * Units used internally: E in Pa, A in m^2, L in m  ->  k in N/m.
+
+(2) BOUNDARY CONDITIONS  (one entry per global DOF)
+    For every DOF the script asks one of:
+        d <value_in_m>   ->  prescribed displacement (use 0 for a support)
+        f <value_in_N>   ->  prescribed external force (use 0 for free)
+    A DOF must have exactly one of {displacement, force} known.
+    If you press <enter>, force = 0 is assumed (free, unloaded).
+
+WHAT YOU GET BACK
+=================
+    * Each element stiffness matrix k^(e), printed BOTH as
+        (A E / L) * [4x4 of direction-cosine pattern]
+      and as a numeric matrix with the common power of 10 pulled out.
+    * Global stiffness matrix K (assembled, with DOF labels).
+    * Solved nodal displacements d.
+    * Reaction forces R at constrained DOFs.
+    * Axial force F^(e) in every member  (+ tension, - compression).
+
+USAGE
+=====
+    Interactive:        python truss_solver.py
+    From a CSV:         python truss_solver.py connectivity.csv
+    With a BC file:     python truss_solver.py connectivity.csv bcs.csv
+
+CSV FORMATS
+===========
+    connectivity.csv   header row required:
+        element,node1,node2,theta_deg,E_GPa,A_mm2,L_m
+
+    bcs.csv            header row required:
+        node,dof,kind,value
+        # dof   = x | y
+        # kind  = d (displacement, m)  or  f (force, N)
+"""
+
+from __future__ import annotations
+
+import csv
+import math
+import sys
+from dataclasses import dataclass
+
+
+# ------------------------------------------------------------------
+# Data structures
+# ------------------------------------------------------------------
+
+@dataclass
+class Element:
+    name: str
+    n1: str
+    n2: str
+    theta_deg: float
+    E_Pa: float       # Young's modulus, Pa
+    A_m2: float       # cross-section, m^2
+    L_m: float        # length, m
+
+    @property
+    def l(self) -> float:
+        return math.cos(math.radians(self.theta_deg))
+
+    @property
+    def m(self) -> float:
+        return math.sin(math.radians(self.theta_deg))
+
+    @property
+    def AE_over_L(self) -> float:
+        return self.A_m2 * self.E_Pa / self.L_m
+
+    def pattern_matrix(self) -> list[list[float]]:
+        """Direction-cosine pattern T such that k = (AE/L) * T."""
+        l, m = self.l, self.m
+        ll, mm, lm = l * l, m * m, l * m
+        return [
+            [ ll,  lm, -ll, -lm],
+            [ lm,  mm, -lm, -mm],
+            [-ll, -lm,  ll,  lm],
+            [-lm, -mm,  lm,  mm],
+        ]
+
+    def k_local(self) -> list[list[float]]:
+        c = self.AE_over_L
+        return [[c * v for v in row] for row in self.pattern_matrix()]
+
+
+# ------------------------------------------------------------------
+# Pretty-printing
+# ------------------------------------------------------------------
+
+def _fmt(x: float, width: int = 10) -> str:
+    if abs(x) < 1e-12:
+        return f"{0.0:>{width}.4f}"
+    return f"{x:>{width}.4f}"
+
+
+def print_matrix(M, col_labels=None, row_labels=None, title=None, scale=None):
+    if title:
+        print(title)
+    n = len(M)
+    cols = len(M[0])
+    rlw = max((len(r) for r in (row_labels or [])), default=0)
+    cw = 12
+
+    if col_labels:
+        header = " " * (rlw + 2)
+        for c in col_labels:
+            header += f"{c:>{cw}}"
+        print(header)
+
+    factor_str = ""
+    if scale is not None and scale != 1.0:
+        factor_str = f"{scale:.3g} * "
+    if factor_str:
+        print(f"  [factor: {factor_str}]")
+
+    for i in range(n):
+        rl = (row_labels[i] if row_labels else "")
+        line = f"{rl:>{rlw}}  "
+        for j in range(cols):
+            v = M[i][j] / (scale if scale else 1.0)
+            line += f"{_fmt(v, cw)}"
+        print(line)
+    print()
+
+
+def common_power_of_ten(M) -> float:
+    """Return 10**p where p = floor(log10(max|entry|))."""
+    mx = max((abs(v) for row in M for v in row), default=0.0)
+    if mx == 0.0:
+        return 1.0
+    p = math.floor(math.log10(mx))
+    return 10.0 ** p
+
+
+# ------------------------------------------------------------------
+# Input
+# ------------------------------------------------------------------
+
+def read_connectivity_csv(path: str) -> list[Element]:
+    out = []
+    with open(path, newline="") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            out.append(Element(
+                name=row["element"].strip(),
+                n1=row["node1"].strip(),
+                n2=row["node2"].strip(),
+                theta_deg=float(row["theta_deg"]),
+                E_Pa=float(row["E_GPa"]) * 1e9,
+                A_m2=float(row["A_mm2"]) * 1e-6,
+                L_m=float(row["L_m"]),
+            ))
+    return out
+
+
+def read_connectivity_interactive() -> list[Element]:
+    print()
+    print("=" * 70)
+    print(" NODE-ELEMENT CONNECTIVITY CHART")
+    print("=" * 70)
+    print(" Enter one element per line.  Blank line to finish.")
+    print(" Format:")
+    print("    element_name node1 node2 theta_deg E_GPa A_mm2 L_m")
+    print(" Example:")
+    print("    1 A B 45 200 100 2.828")
+    print("-" * 70)
+    elements = []
+    while True:
+        line = input(f" element #{len(elements)+1}: ").strip()
+        if not line:
+            if not elements:
+                print(" Need at least one element.")
+                continue
+            break
+        parts = line.split()
+        if len(parts) != 7:
+            print(" ! Expected 7 fields, try again.")
+            continue
+        try:
+            elements.append(Element(
+                name=parts[0],
+                n1=parts[1],
+                n2=parts[2],
+                theta_deg=float(parts[3]),
+                E_Pa=float(parts[4]) * 1e9,
+                A_m2=float(parts[5]) * 1e-6,
+                L_m=float(parts[6]),
+            ))
+        except ValueError as e:
+            print(f" ! Could not parse ({e}), try again.")
+    return elements
+
+
+# ------------------------------------------------------------------
+# Assembly
+# ------------------------------------------------------------------
+
+def build_dof_index(elements: list[Element]) -> dict[str, int]:
+    """Assign DOF indices 2i, 2i+1 in node-first-seen order."""
+    nodes: list[str] = []
+    seen: set[str] = set()
+    for e in elements:
+        for n in (e.n1, e.n2):
+            if n not in seen:
+                seen.add(n)
+                nodes.append(n)
+    return {n: 2 * i for i, n in enumerate(nodes)}, nodes
+
+
+def element_dof_map(e: Element, idx: dict[str, int]) -> list[int]:
+    a, b = idx[e.n1], idx[e.n2]
+    return [a, a + 1, b, b + 1]
+
+
+def element_dof_labels(e: Element) -> list[str]:
+    return [f"d_{e.n1}x", f"d_{e.n1}y", f"d_{e.n2}x", f"d_{e.n2}y"]
+
+
+def assemble_global(elements, idx, n_nodes):
+    n = 2 * n_nodes
+    K = [[0.0] * n for _ in range(n)]
+    for e in elements:
+        ke = e.k_local()
+        dmap = element_dof_map(e, idx)
+        for i in range(4):
+            for j in range(4):
+                K[dmap[i]][dmap[j]] += ke[i][j]
+    return K
+
+
+def all_dof_labels(nodes: list[str]) -> list[str]:
+    out = []
+    for n in nodes:
+        out += [f"d_{n}x", f"d_{n}y"]
+    return out
+
+
+# ------------------------------------------------------------------
+# Boundary conditions
+# ------------------------------------------------------------------
+
+def read_bcs_csv(path: str, nodes, idx):
+    """Returns (kind, value) per global DOF."""
+    n = 2 * len(nodes)
+    kind = [None] * n
+    val = [0.0] * n
+    with open(path, newline="") as f:
+        for row in csv.DictReader(f):
+            node = row["node"].strip()
+            ax = row["dof"].strip().lower()
+            k = row["kind"].strip().lower()
+            v = float(row["value"])
+            if node not in idx:
+                raise ValueError(f"BC references unknown node {node!r}")
+            off = 0 if ax == "x" else 1
+            g = idx[node] + off
+            kind[g] = k
+            val[g] = v
+    # Defaults: any DOF not specified -> free (force = 0).
+    for g in range(n):
+        if kind[g] is None:
+            kind[g] = "f"
+            val[g] = 0.0
+    return kind, val
+
+
+def read_bcs_interactive(nodes, idx):
+    n = 2 * len(nodes)
+    kind = [None] * n
+    val = [0.0] * n
+    print()
+    print("=" * 70)
+    print(" BOUNDARY CONDITIONS")
+    print("=" * 70)
+    print(" For every DOF, enter ONE of:")
+    print("     d <value_in_m>     prescribed displacement (0 = pinned)")
+    print("     f <value_in_N>     prescribed force (0 = free, unloaded)")
+    print(" Press <enter> to default to f 0.")
+    print("-" * 70)
+    labels = all_dof_labels(nodes)
+    for g, lab in enumerate(labels):
+        while True:
+            s = input(f"  {lab:>8}: ").strip().lower()
+            if s == "":
+                kind[g], val[g] = "f", 0.0
+                break
+            parts = s.split()
+            if len(parts) != 2 or parts[0] not in ("d", "f"):
+                print("    ! Use 'd <value>' or 'f <value>'.")
+                continue
+            try:
+                val[g] = float(parts[1])
+            except ValueError:
+                print("    ! Value must be a number.")
+                continue
+            kind[g] = parts[0]
+            break
+    return kind, val
+
+
+# ------------------------------------------------------------------
+# Solve  (partition K, solve free DOFs, recover reactions)
+# ------------------------------------------------------------------
+
+def _solve_linear(A, b):
+    """Gaussian elimination with partial pivoting (no numpy dependency)."""
+    n = len(A)
+    M = [row[:] + [b[i]] for i, row in enumerate(A)]
+    for i in range(n):
+        piv = max(range(i, n), key=lambda r: abs(M[r][i]))
+        if abs(M[piv][i]) < 1e-14:
+            raise ValueError("Singular reduced stiffness matrix — check BCs.")
+        M[i], M[piv] = M[piv], M[i]
+        for r in range(i + 1, n):
+            f = M[r][i] / M[i][i]
+            for c in range(i, n + 1):
+                M[r][c] -= f * M[i][c]
+    x = [0.0] * n
+    for i in range(n - 1, -1, -1):
+        s = M[i][n] - sum(M[i][j] * x[j] for j in range(i + 1, n))
+        x[i] = s / M[i][i]
+    return x
+
+
+def solve(K, kind, val):
+    n = len(K)
+    free = [i for i in range(n) if kind[i] == "f"]
+    fix  = [i for i in range(n) if kind[i] == "d"]
+    d = list(val)  # prescribed displacements already in val for 'd' DOFs
+    # F at free DOFs is the prescribed external force
+    Ff = [val[i] for i in free]
+    # Subtract K_fc * d_c
+    rhs = [Ff[k] - sum(K[free[k]][c] * d[c] for c in fix) for k in range(len(free))]
+    # Reduced K_ff
+    Kff = [[K[free[i]][free[j]] for j in range(len(free))] for i in range(len(free))]
+    if free:
+        df = _solve_linear(Kff, rhs)
+        for k, g in enumerate(free):
+            d[g] = df[k]
+    # Reactions at fixed DOFs: R = K_row * d  -  F_external_at_that_dof (=0 typically)
+    R = [0.0] * n
+    for i in fix:
+        R[i] = sum(K[i][j] * d[j] for j in range(n))
+    return d, R, free, fix
+
+
+def member_forces(elements, idx, d):
+    """Axial force F^(e) = (AE/L) * [-l -m  l  m] * d_e."""
+    out = []
+    for e in elements:
+        l, m = e.l, e.m
+        dm = element_dof_map(e, idx)
+        de = [d[g] for g in dm]
+        F = e.AE_over_L * (-l * de[0] - m * de[1] + l * de[2] + m * de[3])
+        out.append(F)
+    return out
+
+
+# ------------------------------------------------------------------
+# Driver
+# ------------------------------------------------------------------
+
+BANNER = """
+======================================================================
+ 2D TRUSS SOLVER  -  Matrix Structural Analysis (Direct Stiffness)
+======================================================================
+ You will be asked for TWO things:
+
+   1. The Node-Element Connectivity Chart, one row per element:
+         element , node1 , node2 , theta_deg , E_GPa , A_mm2 , L_m
+      theta_deg = angle from +x axis to the vector node1 -> node2.
+
+   2. Boundary conditions for every global DOF (each node has dX, dY):
+         'd <value_m>'   prescribed displacement (use 0 for support)
+         'f <value_N>'   prescribed external force (use 0 if free)
+
+ Internally:  E [Pa], A [m^2], L [m], so stiffness is in N/m.
+======================================================================
+"""
+
+
+def main(argv):
+    print(BANNER)
+
+    if len(argv) >= 2:
+        elements = read_connectivity_csv(argv[1])
+        print(f" Loaded {len(elements)} elements from {argv[1]}")
+    else:
+        elements = read_connectivity_interactive()
+
+    idx, nodes = build_dof_index(elements)
+
+    # ---- Per-element stiffness matrices ----
+    print("\n" + "=" * 70)
+    print(" ELEMENT STIFFNESS MATRICES")
+    print("=" * 70)
+    for e in elements:
+        labels = element_dof_labels(e)
+        T = e.pattern_matrix()
+        c = e.AE_over_L
+        print(f"\n Element {e.name}:  nodes ({e.n1} -> {e.n2}),  "
+              f"theta = {e.theta_deg} deg,  l = {e.l:.4f},  m = {e.m:.4f}")
+        print(f"   AE/L = ({e.A_m2:.3e} m^2)({e.E_Pa:.3e} Pa)/"
+              f"({e.L_m:.4f} m) = {c:.4e} N/m")
+        print_matrix(
+            T,
+            col_labels=labels, row_labels=labels,
+            title=f"   k^({e.name}) = (AE/L) *",
+        )
+        ke = e.k_local()
+        scale = common_power_of_ten(ke)
+        print_matrix(
+            ke,
+            col_labels=labels, row_labels=labels,
+            title=f"   k^({e.name}) = ",
+            scale=scale,
+        )
+
+    # ---- Global K ----
+    K = assemble_global(elements, idx, len(nodes))
+    labels = all_dof_labels(nodes)
+    print("=" * 70)
+    print(" GLOBAL STIFFNESS MATRIX K")
+    print("=" * 70)
+    scale = common_power_of_ten(K)
+    print_matrix(K, col_labels=labels, row_labels=labels, title="", scale=scale)
+
+    # ---- Boundary conditions ----
+    if len(argv) >= 3:
+        kind, val = read_bcs_csv(argv[2], nodes, idx)
+        print(f" Loaded BCs from {argv[2]}")
+    else:
+        kind, val = read_bcs_interactive(nodes, idx)
+
+    print("\n Boundary-condition summary:")
+    for g, lab in enumerate(labels):
+        units = "m" if kind[g] == "d" else "N"
+        tag = "displacement" if kind[g] == "d" else "force"
+        print(f"   {lab:>8}:  {tag:>13} = {val[g]:+.6g} {units}")
+
+    # ---- Solve ----
+    d, R, free, fix = solve(K, kind, val)
+
+    print("\n" + "=" * 70)
+    print(" RESULTS")
+    print("=" * 70)
+    print("\n Nodal displacements:")
+    for g, lab in enumerate(labels):
+        print(f"   {lab:>8} = {d[g]:+.6e} m")
+
+    print("\n Reactions at constrained DOFs:")
+    if not fix:
+        print("   (none — no displacement BCs)")
+    for g in fix:
+        print(f"   {labels[g]:>8} = {R[g]:+.6e} N")
+
+    print("\n Member axial forces  (+ tension, - compression):")
+    for e, F in zip(elements, member_forces(elements, idx, d)):
+        sign = "T" if F >= 0 else "C"
+        print(f"   F^({e.name}) = {F:+.6e} N   ({sign})")
+
+    print()
+
+
+if __name__ == "__main__":
+    main(sys.argv)

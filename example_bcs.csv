@@ -1,0 +1,9 @@
+node,dof,kind,value
+A,x,d,0
+A,y,d,0
+B,x,f,0
+B,y,f,3000
+C,x,d,0
+C,y,d,0
+D,x,f,0
+D,y,f,0
