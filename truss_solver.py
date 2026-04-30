@@ -304,7 +304,18 @@ def read_bcs_csv(path, nodes, idx):
     kind = [None] * n
     val = [0.0] * n
     with open(path, newline="") as f:
-        for row in csv.DictReader(f):
+        reader = csv.DictReader(f)
+        required = {"node", "dof", "d", "f"}
+        got = set(reader.fieldnames or [])
+        if not required.issubset(got):
+            raise ValueError(
+                f"BC file {path!r} has columns {sorted(got)}; "
+                f"expected at least {sorted(required)}. "
+                f"The old 'kind,value' schema is no longer supported — "
+                f"use columns node,dof,d,f where d and f are each "
+                f"a number or 'x' (unknown)."
+            )
+        for row in reader:
             node = row["node"].strip()
             ax = row["dof"].strip().lower()
             if node not in idx:
@@ -455,6 +466,19 @@ def main(argv):
         elements = read_connectivity_interactive()
 
     idx, nodes = build_dof_index(elements)
+
+    # ---- Echo parsed elements + detected nodes so wrong-CSV mistakes are
+    #      impossible to miss before the BC prompt loop starts.
+    print("\n" + "=" * 70)
+    print(" CONNECTIVITY LOADED")
+    print("=" * 70)
+    for e in elements:
+        print(f"   el {e.name}:  {e.n1} -> {e.n2},  "
+              f"theta = {e.theta_deg:>7.2f} deg,  L = {e.L_m:.4f} m,  "
+              f"E = {e.E_Pa/1e9:g} GPa,  A = {e.A_m2*1e6:g} mm^2")
+    print(f"\n Detected {len(nodes)} nodes: {', '.join(nodes)}")
+    print(f"   -> {2*len(nodes)} global DOFs"
+          f"   -> the BC step will collect {2*len(nodes)} (displacement, force) pairs")
 
     # ---- Global K (assembled first so we can pick ONE shared factor) ----
     K = assemble_global(elements, idx, len(nodes))
