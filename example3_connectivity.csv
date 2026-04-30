@@ -1,0 +1,4 @@
+element,node1,node2,theta_deg,E_GPa,A_mm2,L_m
+1,A,B,0,200,100,4.0
+2,A,C,60,200,100,4.0
+3,B,C,120,200,100,4.0
