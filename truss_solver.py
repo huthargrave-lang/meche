@@ -47,9 +47,12 @@ CSV FORMATS
         element,node1,node2,theta_deg,E_GPa,A_mm2,L_m
 
     bcs.csv            header row required:
-        node,dof,kind,value
-        # dof   = x | y
-        # kind  = d (displacement, m)  or  f (force, N)
+        node,dof,d,f
+        # dof = x | y
+        # d   = prescribed displacement (m), or 'x' if unknown
+        # f   = prescribed external force (N), or 'x' if unknown
+        # exactly one of d, f must be 'x' for each row
+        # any DOF omitted -> defaults to (d=x, f=0): free, unloaded
 """
 
 from __future__ import annotations
@@ -254,12 +257,49 @@ def all_dof_labels(nodes: list[str]) -> list[str]:
     return out
 
 
+def reaction_label(dof_label: str) -> str:
+    """d_Ax -> R_Ax  (just swap the leading 'd_' for 'R_')."""
+    return "R_" + dof_label[2:]
+
+
 # ------------------------------------------------------------------
 # Boundary conditions
 # ------------------------------------------------------------------
 
-def read_bcs_csv(path: str, nodes, idx):
-    """Returns (kind, value) per global DOF."""
+def _parse_bc_token(tok: str):
+    """'x' -> ('x', 0.0)  ;  number -> ('k', float).  Empty -> ('k', 0.0)."""
+    s = tok.strip().lower()
+    if s == "":
+        return "k", 0.0
+    if s == "x":
+        return "x", 0.0
+    return "k", float(s)
+
+
+def _validate_pair(d_state, f_state, label):
+    if d_state == "x" and f_state == "x":
+        raise ValueError(
+            f"DOF {label}: both displacement and force are unknown — "
+            f"need exactly one known."
+        )
+    if d_state == "k" and f_state == "k":
+        raise ValueError(
+            f"DOF {label}: both displacement and force are given — "
+            f"exactly one must be unknown."
+        )
+
+
+def read_bcs_csv(path, nodes, idx):
+    """
+    CSV format (header required):
+        node,dof,d,f
+        # d, f are either a number or 'x' (unknown).
+        # Exactly one of d, f must be 'x' for each DOF.
+        # Any DOF omitted defaults to: d=x, f=0  (free, unloaded).
+    Returns (kind, val) per global DOF, where kind in {'d','f'}:
+        'd' -> displacement is known (val = prescribed displacement),
+        'f' -> force is known        (val = prescribed external force).
+    """
     n = 2 * len(nodes)
     kind = [None] * n
     val = [0.0] * n
@@ -267,14 +307,17 @@ def read_bcs_csv(path: str, nodes, idx):
         for row in csv.DictReader(f):
             node = row["node"].strip()
             ax = row["dof"].strip().lower()
-            k = row["kind"].strip().lower()
-            v = float(row["value"])
             if node not in idx:
                 raise ValueError(f"BC references unknown node {node!r}")
             off = 0 if ax == "x" else 1
             g = idx[node] + off
-            kind[g] = k
-            val[g] = v
+            ds, dv = _parse_bc_token(row.get("d", ""))
+            fs, fv = _parse_bc_token(row.get("f", ""))
+            _validate_pair(ds, fs, f"d_{node}{ax}")
+            if ds == "k":
+                kind[g], val[g] = "d", dv
+            else:
+                kind[g], val[g] = "f", fv
     # Defaults: any DOF not specified -> free (force = 0).
     for g in range(n):
         if kind[g] is None:
@@ -291,28 +334,29 @@ def read_bcs_interactive(nodes, idx):
     print("=" * 70)
     print(" BOUNDARY CONDITIONS")
     print("=" * 70)
-    print(" For every DOF, enter ONE of:")
-    print("     d <value_in_m>     prescribed displacement (0 = pinned)")
-    print("     f <value_in_N>     prescribed force (0 = free, unloaded)")
-    print(" Press <enter> to default to f 0.")
+    print(" For every DOF the script asks TWO questions: its displacement")
+    print(" and its force.  EXACTLY ONE of them must be unknown.")
+    print("    enter a number (e.g. 0, 500, -1.5e-4)  -> that value is known")
+    print("    enter 'x'                              -> that quantity is unknown")
+    print(" Unknown forces are reported as reactions (R_<node><axis>);")
+    print(" unknown displacements are solved for.")
     print("-" * 70)
     labels = all_dof_labels(nodes)
     for g, lab in enumerate(labels):
         while True:
-            s = input(f"  {lab:>8}: ").strip().lower()
-            if s == "":
-                kind[g], val[g] = "f", 0.0
-                break
-            parts = s.split()
-            if len(parts) != 2 or parts[0] not in ("d", "f"):
-                print("    ! Use 'd <value>' or 'f <value>'.")
-                continue
             try:
-                val[g] = float(parts[1])
-            except ValueError:
-                print("    ! Value must be a number.")
+                d_in = input(f"  {lab:>8} displacement [m] (number or x): ")
+                f_in = input(f"  {lab:>8} force        [N] (number or x): ")
+                ds, dv = _parse_bc_token(d_in)
+                fs, fv = _parse_bc_token(f_in)
+                _validate_pair(ds, fs, lab)
+            except ValueError as e:
+                print(f"    ! {e}  Try again.")
                 continue
-            kind[g] = parts[0]
+            if ds == "k":
+                kind[g], val[g] = "d", dv
+            else:
+                kind[g], val[g] = "f", fv
             break
     return kind, val
 
@@ -389,9 +433,12 @@ BANNER = """
          element , node1 , node2 , theta_deg , E_GPa , A_mm2 , L_m
       theta_deg = angle from +x axis to the vector node1 -> node2.
 
-   2. Boundary conditions for every global DOF (each node has dX, dY):
-         'd <value_m>'   prescribed displacement (use 0 for support)
-         'f <value_N>'   prescribed external force (use 0 if free)
+   2. Boundary conditions: for every global DOF (each node has dX, dY)
+    you give BOTH a displacement and a force, where exactly ONE of
+    the two is unknown:
+         number    that quantity is known (use 0 for a support / no load)
+         x         that quantity is unknown (force x  -> reaction R_<dof>;
+                                            disp.  x  -> solved for)
 
  Internally:  E [Pa], A [m^2], L [m], so stiffness is in N/m.
 ======================================================================
@@ -409,12 +456,22 @@ def main(argv):
 
     idx, nodes = build_dof_index(elements)
 
+    # ---- Global K (assembled first so we can pick ONE shared factor) ----
+    K = assemble_global(elements, idx, len(nodes))
+    labels = all_dof_labels(nodes)
+
+    # Single common factor used for EVERY element k and the global K
+    # so all matrices read on the same scale.
+    shared_scale = common_power_of_ten(K)
+
     # ---- Per-element stiffness matrices ----
     print("\n" + "=" * 70)
     print(" ELEMENT STIFFNESS MATRICES")
+    print(f" (every matrix below is shown with the common factor"
+          f" {shared_scale:.0e} pulled out)")
     print("=" * 70)
     for e in elements:
-        labels = element_dof_labels(e)
+        elabels = element_dof_labels(e)
         T = e.pattern_matrix()
         c = e.AE_over_L
         print(f"\n Element {e.name}:  nodes ({e.n1} -> {e.n2}),  "
@@ -423,26 +480,23 @@ def main(argv):
               f"({e.L_m:.4f} m) = {c:.4e} N/m")
         print_matrix(
             T,
-            col_labels=labels, row_labels=labels,
+            col_labels=elabels, row_labels=elabels,
             title=f"   k^({e.name}) = (AE/L) *",
         )
         ke = e.k_local()
-        scale = common_power_of_ten(ke)
         print_matrix(
             ke,
-            col_labels=labels, row_labels=labels,
+            col_labels=elabels, row_labels=elabels,
             title=f"   k^({e.name}) = ",
-            scale=scale,
+            scale=shared_scale,
         )
 
-    # ---- Global K ----
-    K = assemble_global(elements, idx, len(nodes))
-    labels = all_dof_labels(nodes)
+    # ---- Global K (display) ----
     print("=" * 70)
     print(" GLOBAL STIFFNESS MATRIX K")
     print("=" * 70)
-    scale = common_power_of_ten(K)
-    print_matrix(K, col_labels=labels, row_labels=labels, title="", scale=scale)
+    print_matrix(K, col_labels=labels, row_labels=labels, title="",
+                 scale=shared_scale)
 
     # ---- Boundary conditions ----
     if len(argv) >= 3:
@@ -453,9 +507,13 @@ def main(argv):
 
     print("\n Boundary-condition summary:")
     for g, lab in enumerate(labels):
-        units = "m" if kind[g] == "d" else "N"
-        tag = "displacement" if kind[g] == "d" else "force"
-        print(f"   {lab:>8}:  {tag:>13} = {val[g]:+.6g} {units}")
+        if kind[g] == "d":
+            unknown = reaction_label(lab)
+            print(f"   {lab:>8} = {val[g]:+.6g} m   (known)   "
+                  f"-> force {unknown} unknown")
+        else:
+            print(f"   {lab:>8} unknown   "
+                  f"-> force F_{lab[2:]} = {val[g]:+.6g} N (known)")
 
     # ---- Solve ----
     d, R, free, fix = solve(K, kind, val)
@@ -467,11 +525,12 @@ def main(argv):
     for g, lab in enumerate(labels):
         print(f"   {lab:>8} = {d[g]:+.6e} m")
 
-    print("\n Reactions at constrained DOFs:")
+    print("\n Reaction forces (the unknown forces at constrained DOFs):")
     if not fix:
         print("   (none — no displacement BCs)")
     for g in fix:
-        print(f"   {labels[g]:>8} = {R[g]:+.6e} N")
+        rlab = reaction_label(labels[g])
+        print(f"   {rlab:>8} = {R[g]:+.6e} N")
 
     print("\n Member axial forces  (+ tension, - compression):")
     for e, F in zip(elements, member_forces(elements, idx, d)):
